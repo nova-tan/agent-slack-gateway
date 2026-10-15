@@ -321,18 +321,26 @@ class StreamRenderer:
         self._dirty = True
         await self._maybe_update()
 
-    async def finalize(self, error: str | None = None) -> None:
+    async def finalize(self, error: str | None = None, cancelled: bool = False) -> None:
         full = "".join(self.text_parts).strip()
         thoughts = "".join(self.thought_parts).strip()
         if error:
             full = (full + "\n\n" if full else "") + f"⚠️ {error}"
+        elif cancelled:
+            note = "🛑 _Cancelled — the partial output above is kept for context._"
+            full = (full + "\n\n" if full else "") + note
         if not full:
             full = "_(no response)_"
         chunks = chunk_text(full)
         if self.message_ts:
-            with contextlib.suppress(Exception):
+            try:
                 await self.client.chat_update(
                     channel=self.channel, ts=self.message_ts, text=chunks[0], blocks=[])
+            except Exception as exc:
+                logger.warning("finalize update failed for %s: %s", self.conv_key, exc)
+                with contextlib.suppress(Exception):
+                    await self.client.chat_update(
+                        channel=self.channel, ts=self.message_ts, text=chunks[0])
             chunks = chunks[1:]
         for chunk in chunks:
             await self._post(chunk)
@@ -426,7 +434,7 @@ HELP_TEXT = """*copilot-slack-gateway commands*
 • just type — talk to Copilot (reuses this thread's persistent session)
 • `/<skill> [args]` — invoke one of your Copilot skills (registered ones autocomplete)
 • `/new` — discard this conversation's Copilot session and start fresh
-• `/stop` (or the 🛑 Cancel button on a working message) — cancel the currently running prompt
+• `/stop` (or the 🛑 Cancel button on a working message) — cancel the currently running prompt; partial output is kept
 • `/steer <info>` — interrupt the running prompt and fold new information into the task
 • `/tasks` — show gateway-visible active tasks without prompting Copilot
 • `/stream-channel [description or GitHub issue URL]` — create or reuse a dedicated stream channel
@@ -545,8 +553,31 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
         if not authorized((body.get("user") or {}).get("id")):
             return
         key = str((body.get("actions") or [{}])[0].get("value") or "")
-        if not await registry.cancel(key):
-            await respond(response_type="ephemeral", text="Nothing is running here.")
+        if await registry.cancel(key):
+            await respond(response_type="ephemeral",
+                          text="🛑 Cancelling — the partial output stays in the thread.")
+            return
+        conv = registry.get_conversation(key)
+        if conv is not None and getattr(conv, "renderer", None) is not None:
+            # A turn exists but the prompt lock is free: the session is still
+            # starting up (or just wrapping down) and cannot take a cancel yet.
+            await respond(response_type="ephemeral",
+                          text="⏳ The turn is spinning up or winding down — if it's still going, click Cancel again in a moment.")
+            return
+        # Stale button on an already-finished turn: drop the button so it can't
+        # be clicked again, and leave the finalized output untouched.
+        message = body.get("message") or {}
+        channel = str((body.get("channel") or {}).get("id") or "")
+        if channel and message.get("ts"):
+            with contextlib.suppress(Exception):
+                await app.client.chat_update(
+                    channel=channel,
+                    ts=str(message["ts"]),
+                    text=str(message.get("text") or " "),
+                    blocks=[],
+                )
+        await respond(response_type="ephemeral",
+                      text="That turn already finished — the output above is complete.")
 
     # ----------------------------------------------------------- prompt flow
 
@@ -555,8 +586,11 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                                   conv.key)
         conv.renderer = renderer
         error: str | None = None
+        cancelled = False
+        session: ACPSession | None = conv.session
         try:
-            session: ACPSession = conv.session
+            if session is None:
+                raise SessionDeadError("no Copilot session for this conversation")
             starting = not session.alive
             hydrate = starting and not conv.skip_history_on_next_start
             conv.skip_history_on_next_start = False
@@ -575,17 +609,22 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             if starting:
                 await session.start()
                 await post(conv, f"🟢 Copilot session started (`{session.session_id}`, pid {session.pid}, model `{session.model or 'cli default'}`)")
-            await session.prompt(text)
+            result = await session.prompt(text)
+            cancelled = str((result or {}).get("stopReason") or "") == "cancelled"
         except SessionDeadError as exc:
             error = f"Copilot session died: {exc}. Send another message to start a fresh session."
         except asyncio.TimeoutError:
             error = "prompt timed out. Use /stop or /new if it wedged."
         except Exception as exc:
-            logger.exception("prompt failed for %s", conv.key)
-            error = f"{type(exc).__name__}: {exc}"
+            if session is not None and session.cancel_requested:
+                # The user cancelled; the CLI reported the aborted turn as an error.
+                cancelled = True
+            else:
+                logger.exception("prompt failed for %s", conv.key)
+                error = f"{type(exc).__name__}: {exc}"
         finally:
             conv.renderer = None
-            await renderer.finalize(error=error)
+            await renderer.finalize(error=error, cancelled=cancelled)
 
     async def worker(conv: Conversation) -> None:
         while True:

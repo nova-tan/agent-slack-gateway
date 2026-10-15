@@ -115,6 +115,7 @@ class ACPSession:
         self._next_id = itertools.count(1)
         self._write_lock = asyncio.Lock()
         self._prompt_lock = asyncio.Lock()
+        self._cancel_requested = False
         self._stopping = False
 
     # ------------------------------------------------------------------ utils
@@ -125,6 +126,11 @@ class ACPSession:
 
     def busy(self) -> bool:
         return self._prompt_lock.locked()
+
+    @property
+    def cancel_requested(self) -> bool:
+        """True when the in-flight prompt was cancelled by the user (button or /stop)."""
+        return self._cancel_requested
 
     def active_tasks(self) -> list[dict[str, str]]:
         """Return the currently active ACP tool calls without exposing inputs."""
@@ -218,6 +224,7 @@ class ACPSession:
         async with self._prompt_lock:
             if not self.alive:
                 raise SessionDeadError("ACP session is not alive.")
+            self._cancel_requested = False
             result = await self._request(
                 "session/prompt",
                 {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]},
@@ -227,6 +234,7 @@ class ACPSession:
 
     async def cancel(self) -> None:
         if self.alive:
+            self._cancel_requested = True
             try:
                 await self._notify("session/cancel", {"sessionId": self.session_id})
             except Exception:

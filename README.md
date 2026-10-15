@@ -72,7 +72,7 @@ DM the bot (or @mention it in a channel — replies stay in the thread):
 - just type — talk to Copilot
 - `/new` — discard this conversation's session, start fresh
 - `/stop` — cancel the running prompt (or click 🛑 **Cancel** on the "Working…"
-  message)
+  message). The partial output stays in the thread, marked with a 🛑 note
 - `/steer <info>` — interrupt the running prompt and fold new information into
   the task (the session keeps its history, so the agent continues with your
   update in context; jumps ahead of any queued messages)

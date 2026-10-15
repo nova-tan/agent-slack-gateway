@@ -67,6 +67,52 @@ class CancelButtonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.updates[-1]["blocks"], [])
 
+    async def test_finalize_on_cancel_keeps_partial_output(self) -> None:
+        client = _StubClient()
+        renderer = StreamRenderer(client, "C1", None, False, conv_key="C1")
+        await renderer.start()
+        await renderer.add_text("partial answer")
+
+        await renderer.finalize(cancelled=True)
+
+        update = client.updates[-1]
+        self.assertEqual(update["blocks"], [])
+        self.assertIn("partial answer", update["text"])
+        self.assertIn("Cancelled", update["text"])
+        self.assertNotIn("no response", update["text"])
+
+    async def test_finalize_on_cancel_without_any_output(self) -> None:
+        client = _StubClient()
+        renderer = StreamRenderer(client, "C1", None, False, conv_key="C1")
+        await renderer.start()
+
+        await renderer.finalize(cancelled=True)
+
+        update = client.updates[-1]
+        self.assertIn("Cancelled", update["text"])
+        self.assertNotIn("no response", update["text"])
+
+    async def test_finalize_retries_as_plain_text_when_block_update_fails(self) -> None:
+        class FlakyClient(_StubClient):
+            fail_next_update = False
+
+            async def chat_update(self, **kwargs):
+                if self.fail_next_update:
+                    self.fail_next_update = False
+                    raise RuntimeError("rate limited")
+                await super().chat_update(**kwargs)
+
+        client = FlakyClient()
+        renderer = StreamRenderer(client, "C1", None, False, conv_key="C1")
+        await renderer.start()
+        await renderer.add_text("kept despite the hiccup")
+        client.fail_next_update = True
+
+        await renderer.finalize()
+
+        self.assertEqual(client.updates[-1]["text"], "kept despite the hiccup")
+        self.assertNotIn("blocks", client.updates[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

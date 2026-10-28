@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -12,12 +13,14 @@ import time
 import uuid
 from typing import Any
 
+import aiohttp
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-from .acp import ACPSession, SessionDeadError
+from .acp import ACPSession, PromptContent, SessionDeadError
 from .config import Config
+from .github_issues import fetch_issue_title, parse_issue_url
 from .sessions import Conversation, SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -32,10 +35,58 @@ STREAM_CHANNEL_COMMAND = "/stream-channel"
 STREAM_CHANNEL_PREFIX = "stream-"
 STREAM_CHANNEL_MAX_LENGTH = 80
 PROVISIONAL_STREAM_DESCRIPTION = "Awaiting stream description from the user."
-GITHUB_ISSUE_RE = re.compile(
-    r"https?://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)(?:[/?#\s]|$)",
-    re.IGNORECASE,
-)
+IMAGE_UPLOAD_LIMIT = 4
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+
+async def _download_slack_file(bot_token: str, url: str) -> bytes:
+    async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {bot_token}"}) as client:
+        async with client.get(url) as response:
+            response.raise_for_status()
+            return await response.read()
+
+
+async def download_image_blocks(
+    bot_token: str,
+    files: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Download Slack image attachments as ACP image content blocks.
+
+    Returns (blocks, skipped), where skipped entries are "name (reason)"
+    strings for attachments that could not be forwarded.
+    """
+    blocks: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    images: list[tuple[str, str, str]] = []
+    for file in files:
+        name = str(file.get("name") or "attachment")
+        mimetype = str(file.get("mimetype") or "")
+        if not mimetype.startswith("image/"):
+            skipped.append(f"{name} (not an image)")
+            continue
+        if int(file.get("size") or 0) > IMAGE_MAX_BYTES:
+            skipped.append(f"{name} (over {IMAGE_MAX_BYTES // 1024 // 1024} MB)")
+            continue
+        url = str(file.get("url_private_download") or file.get("url_private") or "")
+        if not url:
+            skipped.append(f"{name} (no download URL — is the files:read scope applied?)")
+            continue
+        images.append((name, mimetype, url))
+    for name, mimetype, url in images[:IMAGE_UPLOAD_LIMIT]:
+        try:
+            data = await _download_slack_file(bot_token, url)
+        except Exception:
+            logger.exception("downloading Slack file %s failed", name)
+            skipped.append(f"{name} (download failed)")
+            continue
+        blocks.append({
+            "type": "image",
+            "data": base64.b64encode(data).decode("ascii"),
+            "mimeType": mimetype,
+        })
+    for name, _, _ in images[IMAGE_UPLOAD_LIMIT:]:
+        skipped.append(f"{name} (max {IMAGE_UPLOAD_LIMIT} images per message)")
+    return blocks, skipped
 
 
 def chunk_text(text: str, limit: int = FINAL_CHUNK_LIMIT) -> list[str]:
@@ -132,7 +183,9 @@ def location_context(workspace_url: str, conv: Conversation, stream_name: str | 
     return (
         f"LOCATION — this conversation is in Slack workspace {workspace_url}, {where}{thread}. "
         "When using Slack tools, address this conversation by these identifiers, not any default "
-        "workspace or channel from your skills."
+        "workspace or channel from your skills.\n\n"
+        "SLACK FORMATTING — Slack mrkdwn does not render markdown tables. Render tables as "
+        "fixed-width aligned columns inside a ``` code block so they display nicely."
     )
 
 
@@ -170,19 +223,43 @@ class HistoryFetcher:
         )
 
 
-def stream_id_from_text(text: str) -> str:
-    """Derive a stable stream id from an issue URL or free-form work item."""
+def _slugify(source: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+
+
+def _issue_stream_id(repo: str, number: int, title: str) -> str:
+    """Human-readable stream id: <repo>-<title-slug>-<number>, within Slack limits."""
+    max_id_length = STREAM_CHANNEL_MAX_LENGTH - len(STREAM_CHANNEL_PREFIX)
+    suffix = f"-{number}"
+    slug = _slugify(f"{repo}-{title}")
+    budget = max_id_length - len(suffix)
+    if len(slug) > budget:
+        cut = slug.rfind("-", 0, budget + 1)
+        slug = slug[: cut if cut > budget // 2 else budget].rstrip("-")
+    return f"{slug}{suffix}"
+
+
+def stream_id_from_text(text: str, issue_title: str | None = None) -> str:
+    """Derive a stable stream id from an issue URL or free-form work item.
+
+    When an issue title is supplied the id is human-readable
+    (`<repo>-<title-slug>-<number>`); otherwise issue URLs fall back to the
+    numeric `<owner>-<repo>-issue-<number>` form.
+    """
     value = text.strip()
     if not value:
         raise ValueError("provide a stream description or GitHub issue URL")
 
-    issue = GITHUB_ISSUE_RE.search(value)
+    issue = parse_issue_url(value)
+    if issue and issue_title:
+        return _issue_stream_id(issue[1], issue[2], issue_title)
+
     source = (
-        f"{issue.group(1)}-{issue.group(2)}-issue-{issue.group(3)}"
+        f"{issue[0]}-{issue[1]}-issue-{issue[2]}"
         if issue
         else value
     )
-    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    slug = _slugify(source)
     if not slug:
         raise ValueError("the stream description must contain letters or numbers")
 
@@ -437,7 +514,7 @@ HELP_TEXT = """*copilot-slack-gateway commands*
 • `/stop` (or the 🛑 Cancel button on a working message) — cancel the currently running prompt; partial output is kept
 • `/steer <info>` — interrupt the running prompt and fold new information into the task
 • `/tasks` — show gateway-visible active tasks without prompting Copilot
-• `/stream-channel [description or GitHub issue URL]` — create or reuse a dedicated stream channel
+• `/stream-channel [description or GitHub issue URL]` — create or reuse a dedicated stream channel (issue URLs name the channel from the issue title)
 • `/help` — this message
 """
 
@@ -581,7 +658,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
 
     # ----------------------------------------------------------- prompt flow
 
-    async def run_prompt(conv: Conversation, text: str) -> None:
+    async def run_prompt(conv: Conversation, prompt: PromptContent) -> None:
         renderer = StreamRenderer(app.client, conv.channel, conv.thread_ts, config.show_thoughts,
                                   conv.key)
         conv.renderer = renderer
@@ -604,12 +681,18 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                     recovered = await history.recent_context(conv)
                     if recovered:
                         prefix += "\n\n" + recovered
-                text = f"{prefix}\n\n---\n\nCurrent message:\n{text}"
+                if isinstance(prompt, str):
+                    prompt = f"{prefix}\n\n---\n\nCurrent message:\n{prompt}"
+                else:
+                    prompt = [
+                        {"type": "text", "text": f"{prefix}\n\n---\n\nCurrent message:"},
+                        *prompt,
+                    ]
             await renderer.start()
             if starting:
                 await session.start()
                 await post(conv, f"🟢 Copilot session started (`{session.session_id}`, pid {session.pid}, model `{session.model or 'cli default'}`)")
-            result = await session.prompt(text)
+            result = await session.prompt(prompt)
             cancelled = str((result or {}).get("stopReason") or "") == "cancelled"
         except SessionDeadError as exc:
             error = f"Copilot session died: {exc}. Send another message to start a fresh session."
@@ -628,17 +711,17 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
 
     async def worker(conv: Conversation) -> None:
         while True:
-            text = await conv.queue.get()
-            if text is None:  # shutdown sentinel
+            prompt = await conv.queue.get()
+            if prompt is None:  # shutdown sentinel
                 return
             try:
-                await run_prompt(conv, text)
+                await run_prompt(conv, prompt)
             except Exception:
                 logger.exception("worker iteration failed for %s", conv.key)
             finally:
                 conv.queue.task_done()
 
-    async def dispatch_prompt(conv: Conversation, text: str, fresh: bool) -> None:
+    async def dispatch_prompt(conv: Conversation, prompt: PromptContent, fresh: bool) -> None:
         if conv.worker is None or conv.worker.done():
             conv.worker = asyncio.create_task(worker(conv), name=f"worker-{conv.key}")
         depth = conv.queue.qsize()
@@ -646,19 +729,51 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             await post(conv, "♻️ Previous Copilot session expired or stopped — starting a new one.")
         if depth > 0:
             await post(conv, f"⏳ Still working — your message is queued (position {depth + 1}).")
-        conv.queue.put_nowait(text)
+        conv.queue.put_nowait(prompt)
 
     async def ensure_stream_channel(
         stream_request: str,
         user: str,
     ) -> tuple[dict[str, Any], bool, str | None]:
         stream_request = stream_request.strip()
-        stream_id = stream_id_from_text(stream_request) if stream_request else provisional_stream_id()
-        channel_name = stream_channel_name(stream_id)
-        record = registry.get_stream_channel(stream_id)
+        issue = parse_issue_url(stream_request) if stream_request else None
+
+        record: dict[str, Any] | None = None
+        if issue:
+            # Reuse the channel already created for this issue, even if its
+            # title (and therefore the derived stream id) changed since.
+            record = registry.find_stream_channel_by_issue(*issue)
+
+        if record is None:
+            if not stream_request:
+                stream_id = provisional_stream_id()
+                record = registry.get_stream_channel(stream_id)
+            elif issue:
+                title = await fetch_issue_title(*issue)
+                stream_id = stream_id_from_text(stream_request, issue_title=title)
+                existing = registry.get_stream_channel(stream_id)
+                if existing is not None and parse_issue_url(str(existing.get("description") or "")) == issue:
+                    record = existing
+                elif existing is not None:
+                    # The title-derived id collided with an unrelated stream;
+                    # the numeric id is unique per issue.
+                    stream_id = stream_id_from_text(stream_request)
+                    existing = registry.get_stream_channel(stream_id)
+                    if existing is not None:
+                        if parse_issue_url(str(existing.get("description") or "")) != issue:
+                            raise RuntimeError(
+                                f"stream id `{stream_id}` is already registered to an "
+                                "unrelated stream; refusing to reuse it."
+                            )
+                        record = existing
+            else:
+                stream_id = stream_id_from_text(stream_request)
+                record = registry.get_stream_channel(stream_id)
+
         created = False
 
         if record is None:
+            channel_name = stream_channel_name(stream_id)
             try:
                 response = await app.client.conversations_create(
                     name=channel_name,
@@ -765,9 +880,11 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
         *,
         is_dm: bool,
         is_stream: bool = False,
+        files: list[dict[str, Any]] | None = None,
     ) -> None:
         text = text.strip()
-        if not text:
+        files = files or []
+        if not text and not files:
             return
         key = SessionRegistry.key_for(channel, thread_ts, is_dm=is_dm, is_stream=is_stream)
         reply_thread = None if is_dm or is_stream else thread_ts
@@ -818,6 +935,16 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             # Not a gateway command — treat as a Copilot skill invocation.
             if command:
                 text = skill_invocation_prompt(command.lstrip("/"), arg)
+        prompt: PromptContent = text
+        if files:
+            blocks, skipped = await download_image_blocks(config.slack_bot_token, files)
+            if skipped:
+                await post(reply_conv, f"⚠️ Skipped attachments: {', '.join(skipped)}")
+            if blocks:
+                prompt = [*blocks, {"type": "text", "text": text or "(image shared without a caption)"}]
+            elif not text:
+                await post(reply_conv, "⚠️ I can only forward image attachments to Copilot.")
+                return
         conv, fresh = await registry.get_or_create(
             key,
             channel=channel,
@@ -825,13 +952,14 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             on_event_factory=make_on_event,
             permission_handler_factory=make_permission_handler,
         )
-        await dispatch_prompt(conv, text, fresh)
+        await dispatch_prompt(conv, prompt, fresh)
 
     # --------------------------------------------------------- event handlers
 
     @app.event("message")
     async def on_message(event, say):
-        if event.get("subtype") or event.get("bot_id"):
+        subtype = event.get("subtype")
+        if (subtype and subtype != "file_share") or event.get("bot_id"):
             return
         if not authorized(event.get("user")):
             return
@@ -851,6 +979,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             event["user"],
             is_dm=is_dm,
             is_stream=is_stream,
+            files=event.get("files") or [],
         )
 
     @app.command(re.compile(r"^/[a-z0-9][a-z0-9_-]*$"))
@@ -899,6 +1028,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             event["user"],
             is_dm=False,
             is_stream=is_stream,
+            files=event.get("files") or [],
         )
 
     return app, registry, permissions

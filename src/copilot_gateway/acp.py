@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 _INITIALIZE_PARAMS = {
     "protocolVersion": 1,
     "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
-    "clientInfo": {"name": "copilot-slack-gateway", "title": "Copilot Slack Gateway", "version": "0.1.0"},
+    "clientInfo": {"name": "agent-slack-gateway", "title": "Agent Slack Gateway", "version": "0.1.0"},
 }
+
+PromptContent = str | list[dict[str, Any]]
 
 # on_event(kind, data): kinds are "text", "thought", "tool", "plan", "done", "error"
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -219,7 +221,7 @@ class ACPSession:
 
     # --------------------------------------------------------------- prompting
 
-    async def prompt(self, text: str) -> dict[str, Any]:
+    async def prompt(self, text: PromptContent) -> dict[str, Any]:
         """Send one user prompt; streams updates via on_event. Serialized per session."""
         async with self._prompt_lock:
             if not self.alive:
@@ -227,7 +229,7 @@ class ACPSession:
             self._cancel_requested = False
             result = await self._request(
                 "session/prompt",
-                {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]},
+                {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}] if isinstance(text, str) else text},
                 timeout=self.prompt_timeout,
             )
             return result or {}

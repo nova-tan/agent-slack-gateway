@@ -1,6 +1,6 @@
-# copilot-slack-gateway
+# agent-slack-gateway
 
-Control your **local** GitHub Copilot CLI from Slack. A small Python daemon
+Control your **local** GitHub Copilot CLI or OpenAI Codex CLI from Slack. A small Python daemon
 that connects to Slack over Socket Mode (outbound WebSocket, no public URL)
 and drives a persistent `copilot --acp --stdio` process via the Agent Client
 Protocol.
@@ -9,11 +9,13 @@ Protocol.
 Slack (DM, @mention thread, or managed stream channel)
       │  Socket Mode (outbound)
       ▼
-copilot-slack-gateway  ── spawns/owns ──▶  copilot --acp --stdio
+agent-slack-gateway    ── spawns/owns ──▶  copilot --acp --stdio
       │  JSON-RPC over stdio (ACP)         one process + one ACP session
       ▼                                    per conversation, reused all day
 streamed replies + permission buttons ◀── session/update, request_permission
 ```
+
+To use Codex instead, set `GATEWAY_PROVIDER=codex` in `.env`, install the Codex CLI and authenticate it with `codex login`. The gateway starts `codex app-server --stdio` for each conversation and uses its local Codex configuration, including MCP servers. Optionally set `CODEX_BIN` and `CODEX_MODEL`. Restart the gateway after changing providers.
 
 ## Lifecycle
 
@@ -52,11 +54,11 @@ streamed replies + permission buttons ◀── session/update, request_permissi
 5. Run:
 
    ```bash
-   .venv/bin/copilot-slack-gateway        # or: python -m copilot_gateway
+   .venv/bin/agent-slack-gateway        # or: python -m copilot_gateway
    ```
 
 6. **Keepalive (optional)**: see
-   `launchd/com.example.copilot-slack-gateway.plist`. Replace the
+   `launchd/com.example.agent-slack-gateway.plist`. Replace the
    `__PROJECT_DIR__` and `__HOME_DIR__` placeholders before loading it.
 
 The checked-in example manifest registers the built-in gateway commands. The
@@ -103,7 +105,7 @@ Copilot skill invocation for the existing OMG stream workflow.
 
 Tool permission requests appear as **Approve / Deny buttons** in the thread
 (`APPROVAL_MODE=buttons`, the default). Set `APPROVAL_MODE=auto` to run
-Copilot with `--allow-all-*` flags instead (yolo).
+Copilot with `--allow-all-*` flags instead (yolo). For Codex, `buttons` uses the workspace-write sandbox and on-request approvals; `auto` disables approvals and the sandbox. Codex can perform sandbox-permitted actions without requesting approval.
 
 `/tasks` is handled locally because Copilot's interactive `/tasks` command is
 not available through the ACP interface. It reports the current session state
@@ -116,8 +118,11 @@ See `.env.example`. Notables:
 | Var | Default | Purpose |
 |---|---|---|
 | `ALLOWED_USERS` | _(empty)_ | Comma-separated Slack user IDs allowed to use the bot. Empty denies all users. **Set this.** |
-| `SLACK_WORKSPACE_URL` | `https://example.slack.com` | Workspace base URL used for stream channel links |
+| `SLACK_WORKSPACE_URL` | _(empty)_ | Optional workspace base URL included in conversation context |
 | `GATEWAY_CWD` | `~` | Working dir for all Copilot sessions; ACP fs bridge is confined here |
+| `GATEWAY_PROVIDER` | `copilot` | Select `copilot` or `codex` for all conversations |
+| `CODEX_BIN` | `codex` | Codex CLI executable |
+| `CODEX_MODEL` | CLI default | Optional Codex model ID |
 | `COPILOT_MODEL` | CLI default | Optional model ID supported by your Copilot CLI |
 | `MAX_SESSION_AGE_HOURS` | `18` | "Daily rollover" threshold |
 | `CONTEXT_HISTORY_MESSAGES` | `30` | Recent Slack messages injected as recovery context when a fresh session starts (0 disables). Not injected after `/new`. |
@@ -137,4 +142,4 @@ See `.env.example`. Notables:
   the conversation's location (workspace, channel ID, thread) and recent Slack
   messages (authorized users and the bot only) so the agent recovers context;
   `/new` skips the history but still gets the location.
-- File access via the ACP fs bridge is confined to `GATEWAY_CWD`.
+- Copilot file access through the ACP fs bridge is confined to `GATEWAY_CWD`. Codex uses its own sandbox policy and configuration.

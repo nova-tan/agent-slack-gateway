@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .acp import ACPSession, EventCallback, PermissionHandler
+from .codex import CodexSession
 from .config import Config
 
 logger = logging.getLogger(__name__)
@@ -207,9 +208,12 @@ class SessionRegistry:
                 await conv.session.close()
                 conv.session = None
             if conv.session is None:
-                conv.session = ACPSession(
-                    command=self.config.copilot_bin,
-                    args=self.config.copilot_args,
+                session_class = CodexSession if self.config.provider == "codex" else ACPSession
+                provider_options = ({"command": self.config.codex_bin, "approval_mode": self.config.approval_mode}
+                                    if self.config.provider == "codex" else
+                                    {"command": self.config.copilot_bin, "args": self.config.copilot_args})
+                conv.session = session_class(
+                    **provider_options,
                     cwd=conv.cwd,
                     model=self.config.model,
                     mcp_servers=self.config.mcp_servers,

@@ -111,7 +111,9 @@ THREAD_FETCH_LIMIT = 200
 _GATEWAY_STATUS_PREFIXES = (
     "⏳ Working",
     "🟢 Copilot session started",
+    "🟢 Codex session started",
     "♻️ Previous Copilot session",
+    "♻️ Previous Codex session",
     "⏳ Still working",
 )
 
@@ -180,8 +182,9 @@ def location_context(workspace_url: str, conv: Conversation, stream_name: str | 
     if stream_name:
         where += f" (#{stream_name})"
     thread = f", thread {conv.thread_ts}" if conv.thread_ts else ""
+    workspace = f"workspace {workspace_url}, " if workspace_url else ""
     return (
-        f"LOCATION — this conversation is in Slack workspace {workspace_url}, {where}{thread}. "
+        f"LOCATION — this conversation is in Slack {workspace}{where}{thread}. "
         "When using Slack tools, address this conversation by these identifiers, not any default "
         "workspace or channel from your skills.\n\n"
         "SLACK FORMATTING — Slack mrkdwn does not render markdown tables. Render tables as "
@@ -299,7 +302,8 @@ to describe what this stream should work on, then create or update the OMG
 stream record and continue through the appropriate planning, implementation,
 and verification gates."""
 
-    return f"""You are the primary Copilot session for Slack stream `{stream_id}` in `#{channel_name}` (channel `{channel_id}`, workspace {workspace_url}).
+    workspace = f", workspace {workspace_url}" if workspace_url else ""
+    return f"""You are the primary Copilot session for Slack stream `{stream_id}` in `#{channel_name}` (channel `{channel_id}`{workspace}).
 
 Work directly in this session and keep the user updated in the channel. Do not
 create another Slack channel or launch a subagent merely to own this stream;
@@ -507,7 +511,7 @@ class PermissionManager:
 
 RESERVED_COMMANDS = {"/new", "/stop", "/steer", "/tasks", "/help", STREAM_CHANNEL_COMMAND}
 
-HELP_TEXT = """*copilot-slack-gateway commands*
+HELP_TEXT = """*agent-slack-gateway commands*
 • just type — talk to Copilot (reuses this thread's persistent session)
 • `/<skill> [args]` — invoke one of your Copilot skills (registered ones autocomplete)
 • `/new` — discard this conversation's Copilot session and start fresh
@@ -664,10 +668,10 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
         conv.renderer = renderer
         error: str | None = None
         cancelled = False
-        session: ACPSession | None = conv.session
+        session = conv.session
         try:
             if session is None:
-                raise SessionDeadError("no Copilot session for this conversation")
+                raise SessionDeadError("no agent session for this conversation")
             starting = not session.alive
             hydrate = starting and not conv.skip_history_on_next_start
             conv.skip_history_on_next_start = False
@@ -680,7 +684,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                 if hydrate:
                     recovered = await history.recent_context(conv)
                     if recovered:
-                        prefix += "\n\n" + recovered
+                        prefix += "\n\n" + recovered.replace("your Copilot session", f"your {config.provider.title()} session")
                 if isinstance(prompt, str):
                     prompt = f"{prefix}\n\n---\n\nCurrent message:\n{prompt}"
                 else:
@@ -691,11 +695,11 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             await renderer.start()
             if starting:
                 await session.start()
-                await post(conv, f"🟢 Copilot session started (`{session.session_id}`, pid {session.pid}, model `{session.model or 'cli default'}`)")
+                await post(conv, f"🟢 {config.provider.title()} session started (`{session.session_id}`, pid {session.pid}, model `{session.model or 'cli default'}`)")
             result = await session.prompt(prompt)
             cancelled = str((result or {}).get("stopReason") or "") == "cancelled"
         except SessionDeadError as exc:
-            error = f"Copilot session died: {exc}. Send another message to start a fresh session."
+            error = f"{config.provider.title()} session died: {exc}. Send another message to start a fresh session."
         except asyncio.TimeoutError:
             error = "prompt timed out. Use /stop or /new if it wedged."
         except Exception as exc:
@@ -726,7 +730,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             conv.worker = asyncio.create_task(worker(conv), name=f"worker-{conv.key}")
         depth = conv.queue.qsize()
         if fresh:
-            await post(conv, "♻️ Previous Copilot session expired or stopped — starting a new one.")
+            await post(conv, f"♻️ Previous {config.provider.title()} session expired or stopped — starting a new one.")
         if depth > 0:
             await post(conv, f"⏳ Still working — your message is queued (position {depth + 1}).")
         conv.queue.put_nowait(prompt)
@@ -784,7 +788,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                 if error == "name_taken":
                     raise RuntimeError(
                         f"Slack channel `{channel_name}` already exists but is not registered "
-                        "as a Copilot stream; refusing to take it over."
+                        "as a gateway stream; refusing to take it over."
                     ) from exc
                 raise
 
@@ -838,15 +842,15 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             request_text = (
                 f"Request: {record['description']}"
                 if record["description"] != PROVISIONAL_STREAM_DESCRIPTION
-                else "Tell Copilot what this stream should work on."
+                else "Tell the agent what this stream should work on."
             )
             await app.client.chat_postMessage(
                 channel=channel_id,
                 text=(
-                    f"🚀 *Copilot stream `{record['stream_id']}` is ready*\n"
+                    f"🚀 *Agent stream `{record['stream_id']}` is ready*\n"
                     f"{request_text}\n\n"
                     "Send messages in this channel to continue the stream. "
-                    "This channel is the primary Copilot session."
+                    "This channel is the primary agent session."
                 ),
             )
 
@@ -861,13 +865,12 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                     str(record["description"]),
                     channel_id=str(record["channel_id"]),
                     workspace_url=config.slack_workspace_url,
-                ),
+                ).replace("primary Copilot session", f"primary {config.provider.title()} session"),
                 recycled,
             )
 
-        link = f"{config.slack_workspace_url}/archives/{channel_id}"
         status = "started" if started else "already active"
-        result = f"🚀 Stream `{record['stream_id']}` {status}: <{link}|#{channel_name}>"
+        result = f"🚀 Stream `{record['stream_id']}` {status}: <#{channel_id}|{channel_name}>"
         if invitation_error:
             result += f"\n⚠️ I could not invite you to the channel (`{invitation_error}`)."
         return result
@@ -926,11 +929,11 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
                 text = arg
                 command = ""
             if command == "/help":
-                await post(reply_conv, HELP_TEXT)
+                await post(reply_conv, HELP_TEXT.replace("Copilot", config.provider.title()))
                 return
             if command == "/tasks":
                 # Copilot's interactive /tasks is unavailable over ACP; keep this local.
-                await post(reply_conv, format_task_status(registry.task_status(key)))
+                await post(reply_conv, format_task_status(registry.task_status(key)).replace("Copilot", config.provider.title()))
                 return
             # Not a gateway command — treat as a Copilot skill invocation.
             if command:
@@ -943,7 +946,7 @@ def build_app(config: Config) -> tuple[AsyncApp, SessionRegistry, PermissionMana
             if blocks:
                 prompt = [*blocks, {"type": "text", "text": text or "(image shared without a caption)"}]
             elif not text:
-                await post(reply_conv, "⚠️ I can only forward image attachments to Copilot.")
+                await post(reply_conv, "⚠️ I can only forward image attachments to the agent.")
                 return
         conv, fresh = await registry.get_or_create(
             key,
@@ -1042,7 +1045,7 @@ async def run() -> None:
     config = Config.from_env()
     app, registry, _permissions = build_app(config)
     handler = AsyncSocketModeHandler(app, config.slack_app_token)
-    logger.info("starting copilot-slack-gateway (cwd=%s, model=%s, approvals=%s)",
+    logger.info("starting agent-slack-gateway (cwd=%s, model=%s, approvals=%s)",
                 config.cwd, config.model or "cli default", config.approval_mode)
 
     async def shutdown() -> None:

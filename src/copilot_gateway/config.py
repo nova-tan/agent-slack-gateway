@@ -110,6 +110,8 @@ def load_mcp_servers(path: Path) -> list[dict[str, Any]]:
 class Config:
     slack_bot_token: str
     slack_app_token: str
+    provider: str = "copilot"
+    codex_bin: str = "codex"
     copilot_bin: str = "copilot"
     model: str | None = None
     mcp_servers: list[dict[str, Any]] = field(default_factory=list)
@@ -122,7 +124,7 @@ class Config:
     permission_timeout_seconds: float = 300.0
     prompt_timeout_seconds: float = 3600.0
     context_history_messages: int = 30
-    slack_workspace_url: str = "https://example.slack.com"
+    slack_workspace_url: str = ""
 
     @property
     def copilot_args(self) -> tuple[str, ...]:
@@ -148,6 +150,10 @@ class Config:
         if approval_mode not in ("buttons", "auto"):
             raise SystemExit(f"APPROVAL_MODE must be 'buttons' or 'auto', got {approval_mode!r}")
 
+        provider = os.environ.get("GATEWAY_PROVIDER", "copilot").strip().lower()
+        if provider not in ("copilot", "codex"):
+            raise SystemExit(f"GATEWAY_PROVIDER must be copilot or codex, got {provider!r}")
+
         mcp_config_path = Path(
             os.environ.get("COPILOT_MCP_CONFIG", str(Path.home() / ".copilot/mcp-config.json"))
         ).expanduser()
@@ -155,13 +161,12 @@ class Config:
         return cls(
             slack_bot_token=bot,
             slack_app_token=app,
-            slack_workspace_url=(
-                os.environ.get("SLACK_WORKSPACE_URL", "https://example.slack.com").strip().rstrip("/")
-                or "https://example.slack.com"
-            ),
+            slack_workspace_url=os.environ.get("SLACK_WORKSPACE_URL", "").strip().rstrip("/"),
+            provider=provider,
+            codex_bin=os.environ.get("CODEX_BIN", "codex").strip() or "codex",
             copilot_bin=os.environ.get("COPILOT_BIN", "copilot").strip() or "copilot",
-            model=(os.environ.get("COPILOT_MODEL") or os.environ.get("COPILOT_DEFAULT_MODEL") or "").strip() or None,
-            mcp_servers=load_mcp_servers(mcp_config_path),
+            model=((os.environ.get("CODEX_MODEL") if provider == "codex" else (os.environ.get("COPILOT_MODEL") or os.environ.get("COPILOT_DEFAULT_MODEL"))) or "").strip() or None,
+            mcp_servers=load_mcp_servers(mcp_config_path) if provider == "copilot" else [],
             cwd=str(Path(os.environ.get("GATEWAY_CWD", str(Path.home()))).expanduser().resolve()),
             approval_mode=approval_mode,
             allowed_users=frozenset(

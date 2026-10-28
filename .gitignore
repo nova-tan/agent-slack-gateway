@@ -8,3 +8,4 @@ slack-app-manifest.yaml
 .DS_Store
 .copilot-slack-gateway/
 *.log
+.omx/

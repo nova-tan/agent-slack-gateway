@@ -54,6 +54,11 @@ class StreamChannelTests(unittest.TestCase):
                 restored.get_stream_channel("acme-widget-issue-42")["channel_id"],
                 "C123",
             )
+            self.assertEqual(
+                restored.find_stream_channel_by_issue("ACME", "Widget", 42)["channel_id"],
+                "C123",
+            )
+            self.assertIsNone(restored.find_stream_channel_by_issue("acme", "widget", 43))
 
     def test_stream_channel_uses_one_conversation_key(self) -> None:
         self.assertEqual(

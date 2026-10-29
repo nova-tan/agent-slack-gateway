@@ -146,6 +146,9 @@ class Config:
                 "Create the Slack app from slack-app-manifest.yaml, enable Socket Mode, "
                 "and put the tokens in .env (see .env.example)."
             )
+        workspace_url = os.environ.get("SLACK_WORKSPACE_URL", "").strip().rstrip("/")
+        if not workspace_url:
+            raise SystemExit("SLACK_WORKSPACE_URL is required; set it to your Slack workspace's base URL.")
         approval_mode = os.environ.get("APPROVAL_MODE", "buttons").strip().lower()
         if approval_mode not in ("buttons", "auto"):
             raise SystemExit(f"APPROVAL_MODE must be 'buttons' or 'auto', got {approval_mode!r}")
@@ -161,7 +164,7 @@ class Config:
         return cls(
             slack_bot_token=bot,
             slack_app_token=app,
-            slack_workspace_url=os.environ.get("SLACK_WORKSPACE_URL", "").strip().rstrip("/"),
+            slack_workspace_url=workspace_url,
             provider=provider,
             codex_bin=os.environ.get("CODEX_BIN", "codex").strip() or "codex",
             copilot_bin=os.environ.get("COPILOT_BIN", "copilot").strip() or "copilot",

@@ -118,7 +118,7 @@ See `.env.example`. Notables:
 | Var | Default | Purpose |
 |---|---|---|
 | `ALLOWED_USERS` | _(empty)_ | Comma-separated Slack user IDs allowed to use the bot. Empty denies all users. **Set this.** |
-| `SLACK_WORKSPACE_URL` | _(empty)_ | Optional workspace base URL included in conversation context |
+| `SLACK_WORKSPACE_URL` | _(required)_ | Workspace base URL used for stream channel links and conversation context |
 | `GATEWAY_CWD` | `~` | Working dir for all Copilot sessions; ACP fs bridge is confined here |
 | `GATEWAY_PROVIDER` | `copilot` | Select `copilot` or `codex` for all conversations |
 | `CODEX_BIN` | `codex` | Codex CLI executable |

@@ -16,9 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .acp import ACPSession, EventCallback, PermissionHandler
+from .acp import ACPSession, EventCallback, PermissionHandler, PromptContent
 from .codex import CodexSession
 from .config import Config
+from .github_issues import parse_issue_url
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class Conversation:
     cwd: str
     session: ACPSession | None = None
     created_at: float = 0.0
-    queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue[PromptContent | None] = field(default_factory=asyncio.Queue)
     worker: asyncio.Task[None] | None = None
     skip_history_on_next_start: bool = False
 
@@ -116,6 +117,13 @@ class SessionRegistry:
     def get_stream_channel_by_slack_id(self, channel_id: str) -> dict[str, Any] | None:
         for record in self._stream_channels.values():
             if record.get("channel_id") == channel_id:
+                return dict(record)
+        return None
+
+    def find_stream_channel_by_issue(self, owner: str, repo: str, number: int) -> dict[str, Any] | None:
+        for record in self._stream_channels.values():
+            issue = parse_issue_url(str(record.get("description") or ""))
+            if issue and (issue[0].lower(), issue[1].lower(), issue[2]) == (owner.lower(), repo.lower(), number):
                 return dict(record)
         return None
 
@@ -256,7 +264,7 @@ class SessionRegistry:
         if conv is None or conv.session is None or not conv.session.busy():
             return False
         await conv.session.cancel()
-        pending: list[str] = []
+        pending: list[PromptContent | None] = []
         while True:
             try:
                 pending.append(conv.queue.get_nowait())
